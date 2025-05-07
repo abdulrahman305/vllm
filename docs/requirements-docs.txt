@@ -22,3 +22,4 @@ fastapi # Required by docs/source/serving/openai_compatible_server.md's vllm.ent
 partial-json-parser # Required by docs/source/serving/openai_compatible_server.md's vllm.entrypoints.openai.cli_args
 requests
 zmq
+setuptools>=78.1.1 # not directly required, pinned by Snyk to avoid a vulnerability
