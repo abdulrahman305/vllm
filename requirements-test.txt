@@ -617,7 +617,7 @@ tqdm==4.66.6
     #   transformers
 tqdm-multiprocess==0.0.11
     # via lm-eval
-transformers==4.48.2
+transformers==4.50.0
     # via
     #   -r requirements-test.in
     #   genai-perf
@@ -673,3 +673,4 @@ zstandard==0.23.0
 
 # The following packages are considered to be unsafe in a requirements file:
 # setuptools
+setuptools>=78.1.1 # not directly required, pinned by Snyk to avoid a vulnerability
