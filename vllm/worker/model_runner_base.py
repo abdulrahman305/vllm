@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
 from abc import ABC, abstractmethod
@@ -11,7 +12,11 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.sampler import SamplerOutput
+from vllm.model_executor.models.interfaces import supports_transcription
+from vllm.model_executor.models.interfaces_base import (
+    is_pooling_model, is_text_generation_model)
 from vllm.sequence import IntermediateTensors, SequenceGroupMetadata
+from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 
 if TYPE_CHECKING:
     from vllm.attention import AttentionMetadata
@@ -46,7 +51,10 @@ def _init_attn_metadata_from_tensor_dict(
     valid_attn_kwargs = {}
     for field in dataclasses.fields(attn_backend.get_metadata_cls()):
         if field.name in tensor_dict:
-            valid_attn_kwargs[field.name] = tensor_dict.pop(field.name)
+            if field.name == "input_positions":
+                valid_attn_kwargs[field.name] = tensor_dict[field.name]
+            else:
+                valid_attn_kwargs[field.name] = tensor_dict.pop(field.name)
 
     attn_metadata = attn_backend.make_metadata(**valid_attn_kwargs)
     tensor_dict["attn_metadata"] = attn_metadata
@@ -184,7 +192,6 @@ class ModelRunnerBase(ABC, Generic[T]):
         self.scheduler_config = vllm_config.scheduler_config
         self.device_config = vllm_config.device_config
         self.speculative_config = vllm_config.speculative_config
-        self.prompt_adapter_config = vllm_config.prompt_adapter_config
         self.observability_config = vllm_config.observability_config
 
     # Map of request_id -> generator used for seeded random sampling
@@ -218,6 +225,38 @@ class ModelRunnerBase(ABC, Generic[T]):
     @abstractmethod
     def get_model(self) -> nn.Module:
         raise NotImplementedError
+
+    def get_supported_generation_tasks(self) -> list[GenerationTask]:
+        model = self.get_model()
+        supported_tasks = list[GenerationTask]()
+
+        if is_text_generation_model(model):
+            supported_tasks.append("generate")
+
+        if supports_transcription(model):
+            if model.supports_transcription_only:
+                return ["transcription"]
+
+            supported_tasks.append("transcription")
+
+        return supported_tasks
+
+    def get_supported_pooling_tasks(self) -> list[PoolingTask]:
+        model = self.get_model()
+        if not is_pooling_model(model):
+            return []
+
+        return list(model.pooler.get_supported_tasks())
+
+    def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
+        tasks = list[SupportedTask]()
+
+        if self.model_config.runner_type == "generate":
+            tasks.extend(self.get_supported_generation_tasks())
+        if self.model_config.runner_type == "pooling":
+            tasks.extend(self.get_supported_pooling_tasks())
+
+        return tuple(tasks)
 
     def execute_model(
         self,
@@ -258,3 +297,21 @@ class ModelRunnerWrapperBase:
 
     def __getattr__(self, attr):
         return getattr(self.model_runner, attr)
+
+
+class InputProcessingError(Exception):
+    """This exception is raised when an error occurs preparing the inputs for
+    a single sequence group.
+    This allows the engine to gracefully handle errors with a single sequence
+    group without having to fail the entire batch.
+    """
+
+    def __init__(self, request_id, message):
+        """request_id is the id of the offending sequence group"""
+        self.request_id = request_id
+        self.message = message
+        super().__init__(self.message)
+
+    def __str__(self):
+        return "Failed to prepare inputs for sequence group with request id: " \
+                f"{self.request_id}, Error: {self.message}"

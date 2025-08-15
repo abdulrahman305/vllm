@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 # Derived from BART implementation posted on HuggingFace; license below:
 #
@@ -19,31 +20,33 @@
 # limitations under the License.
 """PyTorch BART model."""
 import math
-from typing import Iterable, List, Optional, Tuple
+from collections.abc import Iterable
+from typing import Optional
 
 import torch
 from torch import nn
 from transformers import BartConfig
 from transformers.utils import logging
 
-from vllm.attention import Attention, AttentionMetadata, AttentionType
+from vllm.attention import Attention, AttentionType
 from vllm.config import CacheConfig, LoRAConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
+                                               QKVCrossParallelLinear,
                                                QKVParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
-from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead, VocabParallelEmbedding)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 
-from .utils import maybe_prefix
+from .interfaces import SupportsQuant, SupportsV0Only
+from .utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
 
 logger = logging.get_logger(__name__)
 
@@ -168,7 +171,7 @@ class BartEncoderAttention(nn.Module):
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
             assert tp_world_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_world_size)
+        self.num_kv_heads = self.num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
 
@@ -181,14 +184,13 @@ class BartEncoderAttention(nn.Module):
                               prefix=f"{prefix}.attn",
                               attn_type=AttentionType.ENCODER)
 
-    def forward(self, hidden_states: torch.Tensor, kv_cache: torch.Tensor,
-                attn_metadata: AttentionMetadata) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Input shape: Batch x Time x Channel"""
 
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+        attn_output = self.attn(q, k, v)
 
         output, _ = self.out_proj(attn_output)
         return output
@@ -248,7 +250,7 @@ class BartDecoderSelfAttention(nn.Module):
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
             assert tp_world_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_world_size)
+        self.num_kv_heads = self.num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
 
@@ -261,14 +263,13 @@ class BartDecoderSelfAttention(nn.Module):
                               prefix=f"{prefix}.attn",
                               attn_type=AttentionType.DECODER)
 
-    def forward(self, hidden_states: torch.Tensor, kv_cache: torch.Tensor,
-                attn_metadata: AttentionMetadata) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Input shape: Batch x Time x Channel"""
 
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+        attn_output = self.attn(q, k, v)
 
         output, _ = self.out_proj(attn_output)
         return output
@@ -300,14 +301,14 @@ class BartCrossAttention(nn.Module):
                              f" and `num_heads`: {num_heads}).")
         self.scaling = self.head_dim**-0.5
 
-        self.qkv_proj = QKVParallelLinear(
-            self.d_model,
-            self.d_model // self.total_num_heads,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=bias,
-            quant_config=quant_config,
-        )
+        # TP sharding sizes is accounted for within "*Parallel" layers.
+        self.qkv_proj = QKVCrossParallelLinear(self.d_model,
+                                               self.d_model //
+                                               self.total_num_heads,
+                                               self.total_num_heads,
+                                               self.total_num_kv_heads,
+                                               bias,
+                                               quant_config=quant_config)
 
         self.out_proj = RowParallelLinear(
             embed_dim,
@@ -328,10 +329,7 @@ class BartCrossAttention(nn.Module):
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
             assert tp_world_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_world_size)
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-
+        self.num_kv_heads = self.num_heads  # No GQA in bart
         self.attn = Attention(self.num_heads,
                               self.head_dim,
                               self.scaling,
@@ -344,26 +342,13 @@ class BartCrossAttention(nn.Module):
     def forward(
         self,
         decoder_hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
         encoder_hidden_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Input shape: Batch x Time x Channel"""
 
-        # (afeldman-nm 2024/07/22) TODO:
-        # Need a more efficient solution for q/k/v
-        qkv_dec, _ = self.qkv_proj(decoder_hidden_states)
-        q, _, _ = qkv_dec.split([self.q_size, self.kv_size, self.kv_size],
-                                dim=-1)
-        if encoder_hidden_states is None:
-            k = None
-            v = None
-        else:
-            qkv_enc, _ = self.qkv_proj(encoder_hidden_states)
-            _, k, v = qkv_enc.split([self.q_size, self.kv_size, self.kv_size],
-                                    dim=-1)
+        q, k, v = self.qkv_proj(decoder_hidden_states, encoder_hidden_states)
 
-        attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+        attn_output = self.attn(q, k, v)
 
         output, _ = self.out_proj(attn_output)
         return output
@@ -411,23 +396,16 @@ class BartEncoderLayer(nn.Module):
 
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
 
-    def forward(self, hidden_states: torch.Tensor, kv_cache: torch.Tensor,
-                attn_metadata: AttentionMetadata) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         r"""
         Args:
             hidden_states
                 torch.Tensor of *encoder* input embeddings.
-            kv_cache:
-                Layer-wise list of KV cache tensors
-            attn_metadata:
-                vLLM Attention metadata structure
         Returns:
             Encoder layer output torch.Tensor
         """
         residual = hidden_states
-        hidden_states = self.self_attn(hidden_states=hidden_states,
-                                       kv_cache=kv_cache,
-                                       attn_metadata=attn_metadata)
+        hidden_states = self.self_attn(hidden_states=hidden_states)
 
         hidden_states = residual + hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
@@ -509,18 +487,12 @@ class BartDecoderLayer(nn.Module):
     def forward(
         self,
         decoder_hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
         encoder_hidden_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""
         Args:
             decoder_hidden_states
                 torch.Tensor of *decoder* input embeddings.
-            kv_cache:
-                KV cache tensor
-            attn_metadata:
-                vLLM Attention metadata structure
             encoder_hidden_states
                 torch.Tensor of *encoder* input embeddings.
         Returns:
@@ -529,9 +501,7 @@ class BartDecoderLayer(nn.Module):
         residual = decoder_hidden_states
 
         # Self Attention
-        hidden_states = self.self_attn(hidden_states=decoder_hidden_states,
-                                       kv_cache=kv_cache,
-                                       attn_metadata=attn_metadata)
+        hidden_states = self.self_attn(hidden_states=decoder_hidden_states)
 
         hidden_states = residual + hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
@@ -542,8 +512,6 @@ class BartDecoderLayer(nn.Module):
 
         hidden_states = self.encoder_attn(
             decoder_hidden_states=hidden_states,
-            kv_cache=kv_cache,
-            attn_metadata=attn_metadata,
             encoder_hidden_states=encoder_hidden_states,
         )
 
@@ -609,9 +577,12 @@ class BartEncoder(nn.Module):
 
         self.layernorm_embedding = nn.LayerNorm(embed_dim)
 
-    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor,
-                kv_caches: List[torch.Tensor],
-                attn_metadata: AttentionMetadata) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         r"""
         Args:
             input_ids
@@ -620,15 +591,12 @@ class BartEncoder(nn.Module):
                 provide it.
             positions
                 Positions of *encoder* input sequence tokens.
-            kv_caches:
-                Layer-wise list of KV cache tensors
-            attn_metadata:
-                vLLM Attention metadata structure
         Returns:
             Decoder output torch.Tensor
         """
         # retrieve input_ids and inputs_embeds
-        inputs_embeds = self.embed_tokens(input_ids)
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
 
         embed_pos = self.embed_positions(positions)
         embed_pos = embed_pos.to(inputs_embeds.device)
@@ -636,12 +604,8 @@ class BartEncoder(nn.Module):
         hidden_states = inputs_embeds + embed_pos
         hidden_states = self.layernorm_embedding(hidden_states)
 
-        for idx, encoder_layer in enumerate(self.layers):
-            hidden_states = encoder_layer(
-                hidden_states=hidden_states,
-                kv_cache=kv_caches[idx],
-                attn_metadata=attn_metadata,
-            )
+        for encoder_layer in self.layers:
+            hidden_states = encoder_layer(hidden_states=hidden_states)
 
         return hidden_states
 
@@ -691,11 +655,13 @@ class BartDecoder(nn.Module):
 
         self.layernorm_embedding = nn.LayerNorm(config.d_model)
 
-    def forward(self, decoder_input_ids: torch.Tensor,
-                decoder_positions: torch.Tensor,
-                encoder_hidden_states: Optional[torch.Tensor],
-                kv_caches: List[torch.Tensor],
-                attn_metadata: AttentionMetadata) -> torch.Tensor:
+    def forward(
+        self,
+        decoder_input_ids: torch.Tensor,
+        decoder_positions: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor],
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         r"""
         Args:
             decoder_input_ids
@@ -706,15 +672,13 @@ class BartDecoder(nn.Module):
                 Positions of *decoder* input sequence tokens.
             encoder_hidden_states:
                 Tensor of encoder output embeddings
-            kv_caches:
-                Layer-wise list of KV cache tensors
-            attn_metadata:
-                vLLM Attention metadata structure
         Returns:
             Decoder output torch.Tensor
         """
-
-        inputs_embeds = self.embed_tokens(decoder_input_ids)
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(decoder_input_ids)
+        else:
+            decoder_positions = inputs_embeds[:, -1]
 
         # embed positions
         embed_pos = self.embed_positions(decoder_positions)
@@ -725,20 +689,19 @@ class BartDecoder(nn.Module):
 
         # decoder layers
 
-        for idx, decoder_layer in enumerate(self.layers):
+        for decoder_layer in self.layers:
             hidden_states = decoder_layer(
                 decoder_hidden_states=hidden_states,
-                kv_cache=kv_caches[idx],
-                attn_metadata=attn_metadata,
                 encoder_hidden_states=encoder_hidden_states,
             )
 
         return hidden_states
 
 
-class BartModel(nn.Module):
+class BartModel(nn.Module, SupportsQuant):
     _tied_weights_keys = [
-        "encoder.embed_tokens.weight", "decoder.embed_tokens.weight"
+        "encoder.embed_tokens.weight",
+        "decoder.embed_tokens.weight",
     ]
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -751,7 +714,6 @@ class BartModel(nn.Module):
 
         self.config = config
 
-        self.padding_idx = config.pad_token_id
         lora_vocab = (lora_config.lora_extra_vocab_size *
                       (lora_config.max_loras or 1)) if lora_config else 0
         self.vocab_size = config.vocab_size + lora_vocab
@@ -768,8 +730,7 @@ class BartModel(nn.Module):
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor,
                 encoder_input_ids: torch.Tensor,
-                encoder_positions: torch.Tensor, kv_caches: List[torch.Tensor],
-                attn_metadata: AttentionMetadata) -> torch.Tensor:
+                encoder_positions: torch.Tensor) -> torch.Tensor:
         r"""
         Args:
             input_ids
@@ -782,10 +743,6 @@ class BartModel(nn.Module):
                 Indices of *encoder* input sequence tokens in the vocabulary.
             encoder_positions:
                 Positions of *encoder* input sequence tokens.
-            kv_caches:
-                Layer-wise list of KV cache tensors
-            attn_metadata:
-                vLLM Attention metadata structure
         Returns:
             Model output torch.Tensor
         """
@@ -796,24 +753,65 @@ class BartModel(nn.Module):
             # Run encoder attention if a non-zero number of encoder tokens
             # are provided as input
             encoder_hidden_states = self.encoder(input_ids=encoder_input_ids,
-                                                 positions=encoder_positions,
-                                                 kv_caches=kv_caches,
-                                                 attn_metadata=attn_metadata)
+                                                 positions=encoder_positions)
 
         # decoder outputs consists of
         # (dec_features, past_key_value, dec_hidden, dec_attn)
         decoder_outputs = self.decoder(
             decoder_input_ids=input_ids,
             decoder_positions=positions,
-            encoder_hidden_states=encoder_hidden_states,
-            kv_caches=kv_caches,
-            attn_metadata=attn_metadata)
+            encoder_hidden_states=encoder_hidden_states)
 
         return decoder_outputs
 
+    def load_weights(self, weights: Iterable[tuple[str,
+                                                   torch.Tensor]]) -> set[str]:
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+        ]
 
-class BartForConditionalGeneration(nn.Module):
-    base_model_prefix = "model"
+        other_weights = []
+        loaded_stacked_params = []
+        model_params_dict = dict(self.named_parameters())
+
+        for name, loaded_weight in weights:
+            for (param_name, weight_name, shard_id) in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                if name not in model_params_dict:
+                    continue
+                param = model_params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                loaded_stacked_params.append(name)
+                break
+            else:
+                if name in model_params_dict:
+                    other_weights.append((name, loaded_weight))
+
+        loader = AutoWeightsLoader(self)
+        loaded_params = loader.load_weights(other_weights)
+        loaded_params.update(loaded_stacked_params)
+        return loaded_params
+
+
+class BartForConditionalGeneration(nn.Module, SupportsV0Only, SupportsQuant):
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "decoder.": "model.decoder.",
+            "encoder.": "model.encoder.",
+            "shared.": "model.shared."
+        },
+        orig_to_new_substr={
+            "beta": "bias",
+            "gamma": "weight",
+            "LayerNorm": "layernorm",
+        },
+    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
 
@@ -836,17 +834,13 @@ class BartForConditionalGeneration(nn.Module):
         self.lm_head = BartParallelLMHead(config.vocab_size,
                                           config.d_model,
                                           embed_scale=embed_scale)
-
         self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
                                                 config.vocab_size)
-        self.sampler = get_sampler()
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         *,
         encoder_input_ids: torch.Tensor,
@@ -863,15 +857,11 @@ class BartForConditionalGeneration(nn.Module):
                 torch.Tensor of *encoder* input token ids.
             encoder_positions
                 torch.Tensor of *encoder* position indices
-            kv_caches:
-                Layer-wise list of KV cache tensors
-            attn_metadata:
-                vLLM Attention metadata structure
         Returns:
             Output torch.Tensor
         """
         return self.model(input_ids, positions, encoder_input_ids,
-                          encoder_positions, kv_caches, attn_metadata)
+                          encoder_positions)
 
     def compute_logits(
         self,
@@ -882,69 +872,12 @@ class BartForConditionalGeneration(nn.Module):
                                        sampling_metadata)
         return logits
 
-    def sample(
-        self,
-        logits: Optional[torch.Tensor],
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
-        next_tokens = self.sampler(logits, sampling_metadata)
-        return next_tokens
-
-    stacked_params_mapping = {
-        "q_proj": {
-            "param_name": "qkv_proj",
-            "shard_id": "q",
-        },
-        "k_proj": {
-            "param_name": "qkv_proj",
-            "shard_id": "k",
-        },
-        "v_proj": {
-            "param_name": "qkv_proj",
-            "shard_id": "v",
-        },
-    }
-
-    params_mapping = {
-        "beta": "bias",
-        "gamma": "weight",
-        "LayerNorm": "layernorm",
-    }
-
-    def _rename_key(self, key: str):
-        prefix = f"{self.base_model_prefix}."
-        key = key[len(prefix):] if key.startswith(prefix) else key
-
-        for src, dst in self.params_mapping.items():
-            key = key.replace(src, dst)
-
-        return key
-
-    def _rename_stacked_param(
-        self,
-        name: str,
-    ) -> Tuple[str, Optional[str]]:
-        for key, mapping in self.stacked_params_mapping.items():
-            if key in name:
-                name = name.replace(key, mapping["param_name"])
-                return name, mapping["shard_id"]
-        return name, None
-
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-
-        model_params_dict = dict(self.model.named_parameters())
-        top_params_dict = dict(self.named_parameters())
-
+    def load_weights(self, weights: Iterable[tuple[str,
+                                                   torch.Tensor]]) -> set[str]:
         weights_tuple_list = list(weights)
 
         shared_embedding_weight = None
-        shared_embedding_shard_id = None
-
         for name, loaded_weight in weights_tuple_list:
-
-            name = self._rename_key(name)
-            name, shard_id = self._rename_stacked_param(name)
-
             if ('shared.weight' in name
                     or 'encoder.embed_tokens.weight' in name
                     or 'decoder.embed_tokens.weight' in name
@@ -952,49 +885,24 @@ class BartForConditionalGeneration(nn.Module):
                 assert shared_embedding_weight is None, (
                     "Conflicting embedding weights.")
                 shared_embedding_weight = loaded_weight
-                shared_embedding_shard_id = shard_id
-            else:
-                # Skip the specific downstream task weight.
-                if name.startswith('cls.'):
-                    continue
-                # use Pooler instead.
-                if name.startswith('pooler.'):
-                    continue
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in model_params_dict:
-                    continue
 
-                param = model_params_dict[name]
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
-                if shard_id:
-                    weight_loader(param, loaded_weight, shard_id)
-                else:
-                    weight_loader(param, loaded_weight)
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=(["cls.", "pooler."]),
+        )
+        loaded_params = loader.load_weights(weights_tuple_list,
+                                            mapper=self.hf_to_vllm_mapper)
 
-        # Assign shared weight values
-        encoder_in_param = model_params_dict['encoder.embed_tokens.weight']
-        encoder_in_weight_loader = getattr(encoder_in_param, "weight_loader",
-                                           default_weight_loader)
+        if shared_embedding_weight is not None:
+            weight_loader = getattr(self.lm_head.weight, "weight_loader",
+                                    default_weight_loader)
+            weight_loader(self.lm_head.weight, shared_embedding_weight)
 
-        decoder_in_param = model_params_dict['decoder.embed_tokens.weight']
-        decoder_in_weight_loader = getattr(decoder_in_param, "weight_loader",
-                                           default_weight_loader)
+            self.model.encoder.embed_tokens.weight = self.lm_head.weight
+            self.model.decoder.embed_tokens.weight = self.lm_head.weight
+            loaded_params.update({
+                'model.encoder.embed_tokens.weight', 'lm_head.weight',
+                'model.decoder.embed_tokens.weight'
+            })
 
-        lm_head_in_param = top_params_dict['lm_head.weight']
-        lm_head_in_weight_loader = getattr(lm_head_in_param, "weight_loader",
-                                           default_weight_loader)
-
-        assert shared_embedding_weight is not None
-
-        if shared_embedding_shard_id:
-            encoder_in_weight_loader(encoder_in_param, shared_embedding_weight,
-                                     shared_embedding_shard_id)
-            decoder_in_weight_loader(decoder_in_param, shared_embedding_weight,
-                                     shared_embedding_shard_id)
-            lm_head_in_weight_loader(lm_head_in_param, shared_embedding_weight,
-                                     shared_embedding_shard_id)
-        else:
-            encoder_in_weight_loader(encoder_in_param, shared_embedding_weight)
-            decoder_in_weight_loader(decoder_in_param, shared_embedding_weight)
-            lm_head_in_weight_loader(lm_head_in_param, shared_embedding_weight)
+        return loaded_params

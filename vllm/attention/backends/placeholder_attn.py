@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections import defaultdict
 from dataclasses import dataclass
@@ -320,9 +321,14 @@ class PlaceholderAttentionMetadataBuilder(
                                  -1 if cuda graph is not used.
             batch_size: The maybe padded batch size.
         """
-        for inter_data in self.input_builder.inter_data_list:
-            self._add_seq_group(inter_data,
-                                self.input_builder.chunked_prefill_enabled)
+
+        # Some input builders such as ModelInputForCPUBuilder do not have the
+        # "inter_data_list" attribute.
+        # Let's check inter_data_list exists before we reference it.
+        if hasattr(self.input_builder, "inter_data_list"):
+            for inter_data in self.input_builder.inter_data_list:
+                self._add_seq_group(inter_data,
+                                    self.input_builder.chunked_prefill_enabled)
 
         device = self.runner.device
         use_captured_graph = cuda_graph_pad_size != -1

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Verify that seeded random sampling is deterministic.
 
 Run `pytest tests/samplers/test_seeded_generate.py`.
@@ -17,7 +18,9 @@ RANDOM_SEEDS = list(range(5))
 
 
 @pytest.fixture
-def vllm_model(vllm_runner):
+def vllm_model(vllm_runner, monkeypatch):
+    # This file relies on V0 internals.
+    monkeypatch.setenv("VLLM_USE_V1", "0")
     with vllm_runner(MODEL, dtype="half") as vllm_model:
         yield vllm_model
 
@@ -46,7 +49,7 @@ def test_random_sample_with_seed(
     sampling_params_seed_2 = copy.deepcopy(sampling_params)
     sampling_params_seed_2.seed = 200
 
-    llm = vllm_model.model
+    llm = vllm_model.llm
 
     for prompt in example_prompts:
         for params in (

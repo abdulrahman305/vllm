@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A layer that compute logits from hidden_stats."""
 import inspect
 from concurrent.futures import ThreadPoolExecutor
@@ -8,7 +9,6 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
-from vllm.config import get_current_vllm_config
 from vllm.distributed import (tensor_model_parallel_all_gather,
                               tensor_model_parallel_gather)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -51,10 +51,7 @@ class LogitsProcessor(nn.Module):
         # Soft cap the logits. Used in Gemma 2.
         self.soft_cap = soft_cap
         # Whether to use gather or all-gather to gather the logits.
-        parallel_config = get_current_vllm_config().parallel_config
-        self.use_all_gather = current_platform.is_tpu() \
-            or envs.VLLM_USE_V1 \
-            or parallel_config.distributed_executor_backend == "external_launcher" # noqa
+        self.use_all_gather = current_platform.use_all_gather()
 
     def forward(
         self,
@@ -62,11 +59,12 @@ class LogitsProcessor(nn.Module):
         hidden_states: torch.Tensor,
         sampling_metadata: Optional[SamplingMetadata] = None,
         embedding_bias: Optional[torch.Tensor] = None,
+        prune_hidden_states: bool = True,
     ) -> Optional[torch.Tensor]:
         if self.logits_as_input:
             logits = hidden_states
         else:
-            if sampling_metadata is not None:
+            if sampling_metadata is not None and prune_hidden_states:
                 hidden_states = _prune_hidden_states(hidden_states,
                                                      sampling_metadata)
 
@@ -82,7 +80,8 @@ class LogitsProcessor(nn.Module):
                 logits *= self.scale
 
             # Apply logits processors (if any).
-            if sampling_metadata is not None:
+            if sampling_metadata is not None and \
+                sampling_metadata.seq_groups is not None:
                 logits = _apply_logits_processors(logits, sampling_metadata)
 
         return logits
@@ -108,9 +107,9 @@ class LogitsProcessor(nn.Module):
         embedding_bias: Optional[torch.Tensor],
     ) -> Optional[torch.Tensor]:
         # Get the logits for the next tokens.
-        logits = lm_head.linear_method.apply(lm_head,
-                                             hidden_states,
-                                             bias=embedding_bias)
+        logits = lm_head.quant_method.apply(lm_head,
+                                            hidden_states,
+                                            bias=embedding_bias)
 
         # Gather logits for TP
         logits = self._gather_logits(logits)
@@ -122,7 +121,7 @@ class LogitsProcessor(nn.Module):
 
     def extra_repr(self) -> str:
         s = f"vocab_size={self.vocab_size}"
-        s += f", forg_vocab_size={self.org_vocab_size}"
+        s += f", org_vocab_size={self.org_vocab_size}"
         s += f", scale={self.scale}, logits_as_input={self.logits_as_input}"
         return s
 

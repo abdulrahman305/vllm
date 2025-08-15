@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with xFormers and PagedAttention."""
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Dict, List, Optional, Tuple, Type
 
 import torch
 from xformers import ops as xops
@@ -386,16 +387,21 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         alibi_slopes: Optional[List[float]],
         sliding_window: Optional[int],
         kv_cache_dtype: str,
-        blocksparse_params: Optional[Dict[str, Any]] = None,
         logits_soft_cap: Optional[float] = None,
         attn_type: str = AttentionType.DECODER,
+        kv_sharing_target_layer_name: Optional[str] = None,
+        use_irope: bool = False,
     ) -> None:
-        if blocksparse_params is not None:
-            raise ValueError(
-                "XFormers does not support block-sparse attention.")
+        if kv_sharing_target_layer_name is not None:
+            raise NotImplementedError("KV sharing is not supported in V0 "
+                                      "XFORMERS backend.")
         if logits_soft_cap is not None:
             logger.warning_once("XFormers does not support logits soft cap. "
                                 "Outputs may be slightly off.")
+        if use_irope:
+            logger.warning_once(
+                "Using irope in XFormers is not supported yet, it will fall"
+                " back to global attention for long context.")
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
@@ -406,14 +412,13 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         self.sliding_window = sliding_window
         self.kv_cache_dtype = kv_cache_dtype
 
-        assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
-        suppored_head_sizes = PagedAttention.get_supported_head_sizes()
-        if head_size not in suppored_head_sizes:
+        supported_head_sizes = PagedAttention.get_supported_head_sizes()
+        if head_size not in supported_head_sizes:
             raise ValueError(
                 f"Head size {head_size} is not supported by PagedAttention. "
-                f"Supported head sizes are: {suppored_head_sizes}.")
+                f"Supported head sizes are: {supported_head_sizes}.")
 
         self.attn_type = attn_type
 
@@ -426,6 +431,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         kv_cache: torch.Tensor,
         attn_metadata: "XFormersMetadata",
         output: Optional[torch.Tensor] = None,
+        output_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with xFormers and PagedAttention.
 
@@ -478,6 +484,11 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         Returns:
             shape = [num_tokens, num_heads * head_size]
         """
+        if output_scale is not None:
+            raise NotImplementedError(
+                "fused output quantization is not yet supported"
+                " for XFormersImpl")
+
         attn_type = self.attn_type
         # Check that appropriate attention metadata attributes are
         # selected for the desired attention type
@@ -580,7 +591,6 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                     prefill_meta.block_tables,
                     prefill_meta.query_start_loc,
                     prefill_meta.seq_lens_tensor,
-                    prefill_meta.context_lens_tensor,
                     prefill_meta.max_query_len,
                     self.alibi_slopes,
                     self.sliding_window,
@@ -674,7 +684,9 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
 
                     # Cross-attention mask is non-causal
                     attn_bias = BlockDiagonalMask.from_seqlens(
-                        attn_metadata.seq_lens, attn_metadata.encoder_seq_lens)
+                        attn_metadata.seq_lens,
+                        attn_metadata.encoder_seq_lens,
+                        device=query.device)
 
                 # Encoder branch of encoder-decoder model uses
                 # attn_metadata.encoder_seq_lens
@@ -684,7 +696,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
 
                     # Encoder self-attention mask is non-causal
                     attn_bias = BlockDiagonalMask.from_seqlens(
-                        attn_metadata.encoder_seq_lens)
+                        attn_metadata.encoder_seq_lens, device=query.device)
 
                 # Self-attention block of encoder-only model just
                 # uses the seq_lens directly.
@@ -693,7 +705,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
 
                     # Encoder self-attention mask is non-causal
                     attn_bias = BlockDiagonalMask.from_seqlens(
-                        attn_metadata.seq_lens)
+                        attn_metadata.seq_lens, device=query.device)
 
                 # Self-attention block of decoder branch just
                 # uses the seq_lens directly
@@ -702,7 +714,7 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
 
                     # Decoder self-attention mask is causal
                     attn_bias = BlockDiagonalCausalMask.from_seqlens(
-                        attn_metadata.seq_lens)
+                        attn_metadata.seq_lens, device=query.device)
                 else:
                     raise ValueError("Unknown AttentionType: %s", attn_type)
 
@@ -787,8 +799,6 @@ def _make_alibi_bias(
             dtype=dtype,
         )[:, :, :, :seq_len].copy_(bias)
         bias.mul_(alibi_slopes[:, None, None])
-        if num_heads != num_kv_heads:
-            bias = bias.unflatten(1, (num_kv_heads, num_heads // num_kv_heads))
         attn_biases.append(LowerTriangularMaskWithTensorBias(bias))
 
     return attn_biases

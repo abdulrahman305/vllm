@@ -1,23 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import base64
 import mimetypes
 import os
 from tempfile import NamedTemporaryFile, TemporaryDirectory
-from typing import TYPE_CHECKING, Dict, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import pytest
+import torch
+import torch.multiprocessing as mp
 from PIL import Image, ImageChops
-from transformers import AutoConfig, AutoTokenizer
 
+from tests.utils import multi_gpu_test
+from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed.parallel_state import (init_distributed_environment,
+                                             initialize_model_parallel)
+from vllm.multimodal.image import convert_image_mode
 from vllm.multimodal.inputs import PlaceholderRange
-from vllm.multimodal.utils import (MediaConnector,
-                                   merge_and_sort_multimodal_metadata,
-                                   repeat_and_pad_placeholder_tokens)
+from vllm.multimodal.utils import (MediaConnector, argsort_mm_positions,
+                                   run_dp_sharded_vision_model)
+from vllm.platforms import current_platform
+from vllm.utils import get_open_port, update_environment_variables
 
 if TYPE_CHECKING:
-    from vllm.multimodal.hasher import MultiModalHashDict
     from vllm.multimodal.inputs import MultiModalPlaceholderDict
 
 # Test different image extensions (JPG/PNG) and formats (gray/RGB/RGBA)
@@ -28,9 +35,14 @@ TEST_IMAGE_URLS = [
     "https://upload.wikimedia.org/wikipedia/commons/0/0b/RGBA_comp.png",
 ]
 
+TEST_VIDEO_URLS = [
+    "https://www.bogotobogo.com/python/OpenCV_Python/images/mean_shift_tracking/slow_traffic_small.mp4",
+    "https://github.com/opencv/opencv/raw/refs/tags/4.12.0/samples/data/vtest.avi",
+]
+
 
 @pytest.fixture(scope="module")
-def url_images() -> Dict[str, Image.Image]:
+def url_images() -> dict[str, Image.Image]:
     connector = MediaConnector()
 
     return {
@@ -39,7 +51,7 @@ def url_images() -> Dict[str, Image.Image]:
     }
 
 
-def get_supported_suffixes() -> Tuple[str, ...]:
+def get_supported_suffixes() -> tuple[str, ...]:
     # We should at least test the file types mentioned in GPT-4 with Vision
     OPENAI_SUPPORTED_SUFFIXES = ('.png', '.jpeg', '.jpg', '.webp', '.gif')
 
@@ -50,7 +62,7 @@ def get_supported_suffixes() -> Tuple[str, ...]:
 
 
 def _image_equals(a: Image.Image, b: Image.Image) -> bool:
-    return (np.asarray(a) == np.asarray(b.convert(a.mode))).all()
+    return (np.asarray(a) == np.asarray(convert_image_mode(b, a.mode))).all()
 
 
 @pytest.mark.asyncio
@@ -66,7 +78,7 @@ async def test_fetch_image_http(image_url: str):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("image_url", TEST_IMAGE_URLS)
 @pytest.mark.parametrize("suffix", get_supported_suffixes())
-async def test_fetch_image_base64(url_images: Dict[str, Image.Image],
+async def test_fetch_image_base64(url_images: dict[str, Image.Image],
                                   image_url: str, suffix: str):
     connector = MediaConnector()
     url_image = url_images[image_url]
@@ -136,84 +148,45 @@ async def test_fetch_image_local_files(image_url: str):
                 f"file://{temp_dir}/../{os.path.basename(image_url)}")
 
 
-@pytest.mark.parametrize("model", ["llava-hf/llava-v1.6-mistral-7b-hf"])
-def test_repeat_and_pad_placeholder_tokens(model):
-    config = AutoConfig.from_pretrained(model)
-    image_token_id = config.image_token_index
+@pytest.mark.asyncio
+async def test_fetch_image_error_conversion():
+    connector = MediaConnector()
+    broken_img = "data:image/png;base64,aGVsbG9fdmxsbV9jb21tdW5pdHkK"
 
-    tokenizer = AutoTokenizer.from_pretrained(model)
+    # PIL.UnidentifiedImageError should be converted to ValueError
+    with pytest.raises(ValueError):
+        await connector.fetch_image_async(broken_img)
 
-    test_cases = [
-        (
-            "<image>",
-            2,
-            "<image><image>",
-            [32000, 32000],
-            [{ "offset": 0, "length": 2 }],
-        ),
-        (
-            "<image><image>",
-            2,
-            "<image><image><image>",
-            [32000, 32000, 32000],
-            [{ "offset": 0, "length": 2 }],
-        ),
-        (
-            "<image><image>",
-            [3, 2],
-            "<image><image><image><image><image>",
-            [32000, 32000, 32000, 32000, 32000],
-            [{ "offset": 0, "length": 3 }, { "offset": 3, "length": 2 }],
-        ),
-        (
-            "Image:<image>Image:<image>!",
-            [3, 2],
-            "Image:<image><image><image>Image:<image><image>!",
-            [9833, 28747, 32000, 32000, 32000, 9833, 28747, 32000, 32000, 918],
-            [{ "offset": 2, "length": 3 }, { "offset": 7, "length": 2 }],
-        ),
-        (
-            "<image>",
-            [3, 2],
-            "<image><image><image>",
-            [32000, 32000, 32000],
-            [{ "offset": 0, "length": 3 }],
-        ),
-    ]  # yapf: disable
-
-    for (
-            prompt,
-            repeat_count,
-            expected_prompt,
-            expected_token_ids,
-            expected_ranges,
-    ) in test_cases:
-        new_prompt, new_token_ids, ranges = repeat_and_pad_placeholder_tokens(
-            tokenizer=tokenizer,
-            prompt=prompt,
-            prompt_token_ids=tokenizer.encode(prompt,
-                                              add_special_tokens=False),
-            placeholder_token_id=image_token_id,
-            repeat_count=repeat_count,
-        )
-        assert new_prompt == expected_prompt
-        assert new_token_ids == expected_token_ids
-        assert ranges == expected_ranges
+    with pytest.raises(ValueError):
+        connector.fetch_image(broken_img)
 
 
-# Used for the next two tests related to `merge_and_sort_multimodal_metadata`.
+@pytest.mark.asyncio
+@pytest.mark.parametrize("video_url", TEST_VIDEO_URLS)
+@pytest.mark.parametrize("num_frames", [-1, 32, 1800])
+async def test_fetch_video_http(video_url: str, num_frames: int):
+    connector = MediaConnector(
+        media_io_kwargs={"video": {
+            "num_frames": num_frames,
+        }})
+
+    video_sync, metadata_sync = connector.fetch_video(video_url)
+    video_async, metadata_async = await connector.fetch_video_async(video_url)
+    assert np.array_equal(video_sync, video_async)
+    assert metadata_sync == metadata_async
+
+
+# Used for `test_argsort_mm_positions`.
 class TestCase(NamedTuple):
     mm_positions: "MultiModalPlaceholderDict"
-    mm_hashes: Optional["MultiModalHashDict"]
-    expected_modalities: list[str]
-    expected_ranges: list[PlaceholderRange]
-    expected_hashes: Optional[list[str]]
+    expected_modality_idxs: list[tuple[str, int]]
 
 
-def test_merge_and_sort_multimodal_metadata():
+def test_argsort_mm_positions():
 
     test_cases = [
-        # Single modality should return result as is but flattened
+        # Single modality
+        ## Internally sorted
         TestCase(
             mm_positions={
                 "image": [
@@ -221,34 +194,27 @@ def test_merge_and_sort_multimodal_metadata():
                     PlaceholderRange(offset=3, length=2),
                 ]
             },
-            mm_hashes={"image": ["hash1", "hash2"]},
-            expected_modalities=["image"],
-            expected_ranges=[
-                PlaceholderRange(offset=0, length=2),
-                PlaceholderRange(offset=3, length=2),
+            expected_modality_idxs=[
+                ("image", 0),
+                ("image", 1),
             ],
-            expected_hashes=["hash1", "hash2"],
         ),
-
-        # Single modality without hashes return None for mm hash.
+        ## Internally unsorted
         TestCase(
             mm_positions={
                 "image": [
+                    PlaceholderRange(offset=3, length=2),
                     PlaceholderRange(offset=0, length=2),
-                    PlaceholderRange(offset=2, length=2),
                 ]
             },
-            mm_hashes=None,
-            expected_modalities=["image"],
-            expected_ranges=[
-                PlaceholderRange(offset=0, length=2),
-                PlaceholderRange(offset=2, length=2),
+            expected_modality_idxs=[
+                ("image", 1),
+                ("image", 0),
             ],
-            expected_hashes=None,
         ),
 
-        # Multiple modalities with hashes should return sorted modalities
-        # and flattened ranges and hashes.
+        # Two modalities
+        ## Internally sorted
         TestCase(
             mm_positions={
                 "image": [
@@ -260,47 +226,54 @@ def test_merge_and_sort_multimodal_metadata():
                     PlaceholderRange(offset=2, length=3),
                 ]
             },
-            mm_hashes={
-                "image": ["image_hash1", "image_hash2"],
-                "audio": ["audio_hash1", "audio_hash2"],
-            },
-            expected_modalities=["audio", "image"],
-            expected_ranges=[
-                PlaceholderRange(offset=0, length=2),
-                PlaceholderRange(offset=2, length=3),
-                PlaceholderRange(offset=7, length=4),
-                PlaceholderRange(offset=11, length=5),
-            ],
-            expected_hashes=[
-                "audio_hash1", "audio_hash2", "image_hash1", "image_hash2"
+            expected_modality_idxs=[
+                ("audio", 0),
+                ("audio", 1),
+                ("image", 0),
+                ("image", 1),
             ],
         ),
-
-        # Multiple modalities without hashes should return sorted modalities
-        # and flattened ranges and None.
+        ## Interleaved, internally sorted
         TestCase(
             mm_positions={
                 "image": [
-                    PlaceholderRange(offset=7, length=4),
-                    PlaceholderRange(offset=11, length=5),
+                    PlaceholderRange(offset=0, length=4),
+                    PlaceholderRange(offset=8, length=2),
                 ],
                 "audio": [
-                    PlaceholderRange(offset=0, length=2),
-                    PlaceholderRange(offset=2, length=3),
+                    PlaceholderRange(offset=5, length=2),
+                    PlaceholderRange(offset=11, length=4),
                 ]
             },
-            mm_hashes=None,
-            expected_modalities=["audio", "image"],
-            expected_ranges=[
-                PlaceholderRange(offset=0, length=2),
-                PlaceholderRange(offset=2, length=3),
-                PlaceholderRange(offset=7, length=4),
-                PlaceholderRange(offset=11, length=5),
+            expected_modality_idxs=[
+                ("image", 0),
+                ("audio", 0),
+                ("image", 1),
+                ("audio", 1),
             ],
-            expected_hashes=None,
+        ),
+        ## Interleaved, internally unsorted
+        TestCase(
+            mm_positions={
+                "image": [
+                    PlaceholderRange(offset=8, length=2),
+                    PlaceholderRange(offset=0, length=4),
+                ],
+                "audio": [
+                    PlaceholderRange(offset=11, length=4),
+                    PlaceholderRange(offset=5, length=2),
+                ]
+            },
+            expected_modality_idxs=[
+                ("image", 1),
+                ("audio", 1),
+                ("image", 0),
+                ("audio", 0),
+            ],
         ),
 
         # Three modalities
+        ## Internally sorted
         TestCase(
             mm_positions={
                 "image": [
@@ -316,63 +289,16 @@ def test_merge_and_sort_multimodal_metadata():
                     PlaceholderRange(offset=12, length=6),
                 ]
             },
-            mm_hashes={
-                "image": ["image_hash1", "image_hash2"],
-                "audio": ["audio_hash1"],
-                "video": ["video_hash1", "video_hash2", "video_hash3"]
-            },
-            expected_modalities=["audio", "video", "image"],
-            expected_ranges=[
-                PlaceholderRange(offset=0, length=2),
-                PlaceholderRange(offset=3, length=4),
-                PlaceholderRange(offset=7, length=5),
-                PlaceholderRange(offset=12, length=6),
-                PlaceholderRange(offset=15, length=7),
-                PlaceholderRange(offset=22, length=8),
-            ],
-            expected_hashes=[
-                "audio_hash1", "video_hash1", "video_hash2", "video_hash3",
-                "image_hash1", "image_hash2"
+            expected_modality_idxs=[
+                ("audio", 0),
+                ("video", 0),
+                ("video", 1),
+                ("video", 2),
+                ("image", 0),
+                ("image", 1),
             ],
         ),
-    ]
-
-    for (mm_positions, mm_hashes, expected_modalities, expected_ranges,
-         expected_hashes) in test_cases:
-        modalities, ranges, hashes = merge_and_sort_multimodal_metadata(
-            mm_positions, mm_hashes)
-
-        assert modalities == expected_modalities
-        assert ranges == expected_ranges
-        assert hashes == expected_hashes
-
-
-def test_merge_and_sort_multimodal_metadata_with_interleaving():
-
-    test_cases = [
-
-        # <image> <audio> <image> <audio>
-        TestCase(
-            mm_positions={
-                "image": [
-                    PlaceholderRange(offset=0, length=4),
-                    PlaceholderRange(offset=8, length=2),
-                ],
-                "audio": [
-                    PlaceholderRange(offset=5, length=2),
-                    PlaceholderRange(offset=11, length=4),
-                ]
-            },
-            mm_hashes={
-                "image": ["image_hash1", "image_hash2"],
-                "audio": ["audio_hash1", "audio_hash2"],
-            },
-            expected_modalities=[],
-            expected_ranges=[],
-            expected_hashes=None,
-        ),
-
-        # <image> <image> <video> <audio> <image>
+        ## Interleaved, internally sorted
         TestCase(
             mm_positions={
                 "image": [
@@ -387,16 +313,127 @@ def test_merge_and_sort_multimodal_metadata_with_interleaving():
                     PlaceholderRange(offset=8, length=5),
                 ]
             },
-            mm_hashes=None,
-            expected_modalities=[],
-            expected_ranges=[],
-            expected_hashes=None,
+            expected_modality_idxs=[
+                ("image", 0),
+                ("image", 1),
+                ("audio", 0),
+                ("video", 0),
+                ("image", 2),
+            ],
+        ),
+        ## Interleaved, internally sunorted
+        TestCase(
+            mm_positions={
+                "image": [
+                    PlaceholderRange(offset=0, length=2),
+                    PlaceholderRange(offset=20, length=4),
+                    PlaceholderRange(offset=2, length=3),
+                ],
+                "audio": [
+                    PlaceholderRange(offset=5, length=2),
+                ],
+                "video": [
+                    PlaceholderRange(offset=8, length=5),
+                ]
+            },
+            expected_modality_idxs=[
+                ("image", 0),
+                ("image", 2),
+                ("audio", 0),
+                ("video", 0),
+                ("image", 1),
+            ],
         ),
     ]
 
-    for case in test_cases:
-        with pytest.raises(ValueError) as ex_info:
-            merge_and_sort_multimodal_metadata(case.mm_positions,
-                                               case.mm_hashes)
+    for mm_positions, expected_modality_idxs in test_cases:
+        modality_idxs = argsort_mm_positions(mm_positions)
 
-        assert "Interleaved mixed-modality" in str(ex_info.value)
+        assert modality_idxs == expected_modality_idxs
+
+
+class SimpleLinearModel(torch.nn.Module):
+    """A simple linear vision model for testing."""
+
+    def __init__(self, input_dim: int = 3 * 224 * 224, output_dim: int = 32):
+        super().__init__()
+        self.flatten = torch.nn.Flatten()
+        self.linear = torch.nn.Linear(input_dim, output_dim)
+
+    def forward(self, x: torch.Tensor):
+        # Flatten the input and apply linear transformation
+        x = self.flatten(x)
+        return self.linear(x)
+
+
+@multi_gpu_test(num_gpus=2)
+@pytest.mark.parametrize(
+    "batch_size",
+    [
+        1,  # Single image
+        4,  # Small batch
+        5,  # Odd batch size (for testing padding)
+    ],
+)
+def test_run_dp_sharded_vision_model(batch_size: int):
+    world_size = 2
+    # Launch processes
+    mp.spawn(
+        run_dp_sharded_vision_model_vs_direct,
+        args=(
+            world_size,
+            batch_size,
+            get_open_port(),
+        ),
+        nprocs=world_size,
+    )
+
+
+def run_dp_sharded_vision_model_vs_direct(local_rank: int, world_size: int,
+                                          batch_size: int, master_port: int):
+    """
+    Test that run_dp_sharded_vision_model produces the same results as 
+    calling the model directly.
+    """
+
+    # Set random seed for reproducibility
+    current_platform.seed_everything(0)
+
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
+    torch.set_default_device(device)
+
+    update_environment_variables({
+        'RANK': str(local_rank),
+        'LOCAL_RANK': str(local_rank),
+        'WORLD_SIZE': str(world_size),
+        'MASTER_ADDR': 'localhost',
+        'MASTER_PORT': str(master_port),
+    })
+
+    # initialize distributed
+    init_distributed_environment()
+    initialize_model_parallel(tensor_model_parallel_size=world_size)
+
+    # Create a test input tensor
+    image_input = torch.randn(batch_size, 3, 224, 224)
+
+    # Create a simple linear model
+    vision_model = SimpleLinearModel()
+
+    # Run the model directly on the full input
+    with torch.inference_mode():
+        direct_output = vision_model(image_input)
+
+    # Run the model through the sharded function
+    with torch.inference_mode():
+        sharded_output = run_dp_sharded_vision_model(image_input, vision_model)
+
+    # Check that the world size is setup correctly
+    assert get_tensor_model_parallel_world_size() == world_size
+
+    # Check that the outputs have the same shape
+    assert direct_output.shape == sharded_output.shape
+
+    # Check that the outputs are close (they should be identical)
+    assert torch.allclose(direct_output, sharded_output, rtol=1e-5, atol=1e-5)
