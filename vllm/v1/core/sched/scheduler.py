@@ -29,6 +29,7 @@ from vllm.v1.core.encoder_cache_manager import (
     compute_encoder_budget,
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -40,7 +41,10 @@ from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_qu
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
+from vllm.v1.metrics.stats import (
+    PrefixCacheStats,
+    SchedulerStats,
+)
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
@@ -69,6 +73,12 @@ class Scheduler(SchedulerInterface):
         self.kv_events_config = vllm_config.kv_events_config
         self.parallel_config = vllm_config.parallel_config
         self.log_stats = log_stats
+        self.observability_config = vllm_config.observability_config
+        self.kv_metrics_collector: KVCacheMetricsCollector | None = None
+        if self.observability_config.kv_cache_metrics:
+            self.kv_metrics_collector = KVCacheMetricsCollector(
+                self.observability_config.kv_cache_metrics_sample,
+            )
         self.structured_output_manager = structured_output_manager
         self.is_encoder_decoder = vllm_config.model_config.is_encoder_decoder
 
@@ -187,6 +197,7 @@ class Scheduler(SchedulerInterface):
             dcp_world_size=self.dcp_world_size,
             pcp_world_size=self.pcp_world_size,
             hash_block_size=self.block_size,
+            metrics_collector=self.kv_metrics_collector,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
@@ -263,6 +274,7 @@ class Scheduler(SchedulerInterface):
                     request.num_computed_tokens,
                     num_new_tokens,
                     encoder_compute_budget,
+                    shift_computed_tokens=1 if self.use_eagle else 0,
                 )
 
             if num_new_tokens == 0:
@@ -532,6 +544,7 @@ class Scheduler(SchedulerInterface):
                             num_computed_tokens,
                             num_new_tokens,
                             encoder_compute_budget,
+                            shift_computed_tokens=1 if self.use_eagle else 0,
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
@@ -829,6 +842,7 @@ class Scheduler(SchedulerInterface):
         num_computed_tokens: int,
         num_new_tokens: int,
         encoder_compute_budget: int,
+        shift_computed_tokens: int = 0,
     ) -> tuple[list[int], int, int, list[int]]:
         """
         Determine which encoder inputs need to be scheduled in the current step,
@@ -873,7 +887,10 @@ class Scheduler(SchedulerInterface):
             # The encoder output is needed if the two ranges overlap:
             # [num_computed_tokens, num_computed_tokens + num_new_tokens) and
             # [start_pos, start_pos + num_encoder_tokens)
-            if start_pos >= num_computed_tokens + num_new_tokens:
+            if (
+                start_pos
+                >= num_computed_tokens + num_new_tokens + shift_computed_tokens
+            ):
                 # The encoder input is not needed in this step.
                 break
 
@@ -929,10 +946,12 @@ class Scheduler(SchedulerInterface):
                 # NOTE(woosuk): We assume that the encoder input tokens should
                 # be processed altogether, as the encoder usually uses
                 # bidirectional attention.
-                if num_computed_tokens < start_pos:
+                if num_computed_tokens + shift_computed_tokens < start_pos:
                     # We only schedule the decoder tokens just before the
                     # encoder input.
-                    num_new_tokens = start_pos - num_computed_tokens
+                    num_new_tokens = start_pos - (
+                        num_computed_tokens + shift_computed_tokens
+                    )
                 else:
                     # Because of prefix caching, num_computed_tokens is greater
                     # than start_pos even though its encoder input is not
@@ -1348,14 +1367,24 @@ class Scheduler(SchedulerInterface):
         prefix_cache_stats = self.kv_cache_manager.make_prefix_cache_stats()
         assert prefix_cache_stats is not None
         connector_prefix_cache_stats = self._make_connector_prefix_cache_stats()
+        eviction_events = (
+            self.kv_metrics_collector.drain_events()
+            if self.kv_metrics_collector is not None
+            else []
+        )
+        spec_stats = spec_decoding_stats
+        connector_stats_payload = (
+            kv_connector_stats.data if kv_connector_stats else None
+        )
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
-            spec_decoding_stats=spec_decoding_stats,
-            kv_connector_stats=kv_connector_stats.data if kv_connector_stats else None,
+            kv_cache_eviction_events=eviction_events,
+            spec_decoding_stats=spec_stats,
+            kv_connector_stats=connector_stats_payload,
         )
 
     def make_spec_decoding_stats(
